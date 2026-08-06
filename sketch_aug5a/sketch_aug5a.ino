@@ -1,8 +1,3 @@
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
-
 #include <Arduino.h>
 
 // ==========================================
@@ -11,17 +6,17 @@
 const int dialPulsePin = 18;  // Rotary pulse switch (NC, to GND)
 const int hookPin      = 19;  // Receiver hook switch (NO, to GND)
 const int dialStartPin = 21;  // Rotary wheel off-rest switch (to GND)
-const int audioPin     = 25;  // Single-pin summed audio out (DAC/PWM)
-const int statusLed    = 2;   // Onboard LED (GPIO 2 on most ESP32 boards)
+const int audioPin     = 25;  // Single-pin summed audio out
+const int statusLed    = 2;   // Onboard LED (GPIO 2)
 
 // ==========================================
-// ROTARY PULSE TRACKING
+// ROTARY PULSE TRACKING (BUGFIXED TIMINGS)
 // ==========================================
 volatile int pulseCount = 0;
 volatile unsigned long lastPulseTime = 0;
 volatile unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 30; // 30ms eliminates contact chatter
-const unsigned long dialTimeout   = 400; // 400ms pause indicates end of digit
+const unsigned long debounceDelay = 15; // 15ms is optimal for 10Hz rotary leaf switches
+const unsigned long dialTimeout   = 350; // 350ms window after last pulse
 
 // ==========================================
 // HARDWARE STATE VARIABLES
@@ -31,18 +26,15 @@ bool dialWheelActive = false;
 bool toneIsPlaying   = false;
 
 // ==========================================
-// SOFTWARE DDS AUDIO SYNTHESIS (SINGLE PIN)
+// SOFTWARE DDS AUDIO SYNTHESIS
 // ==========================================
-// Timer & PWM config for 62.5 kHz PWM carrier frequency
-#define PWM_CHANNEL    0
 #define PWM_FREQ       62500  
-#define PWM_RESOLUTION 8      // 8-bit resolution (0-255)
-#define SAMPLE_RATE    8000   // 8 kHz audio sampling rate
+#define PWM_RESOLUTION 8      
+#define SAMPLE_RATE    8000   
 
 hw_timer_t *audioTimer = NULL;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
-// Look Up Table (256-point Sine Wave)
 const uint8_t PROGMEM sineTable[256] = {
   128, 131, 134, 137, 140, 143, 146, 149, 152, 155, 158, 162, 165, 167, 170, 173,
   176, 179, 182, 185, 188, 190, 193, 196, 198, 201, 203, 206, 208, 211, 213, 215,
@@ -62,54 +54,46 @@ const uint8_t PROGMEM sineTable[256] = {
   115, 118, 121, 124
 };
 
-// DDS Phase accumulators (32-bit fixed point)
 volatile uint32_t phaseAcc350 = 0;
 volatile uint32_t phaseAcc440 = 0;
-// Phase increments calculated for 8 kHz sample rate
 const uint32_t phaseInc350 = (350ULL * 4294967296ULL) / SAMPLE_RATE;
 const uint32_t phaseInc440 = (440ULL * 4294967296ULL) / SAMPLE_RATE;
 
-// Timer Interrupt Service Routine - Runs at 8000 Hz
-void IRAM_ATTR onAudioTimer() {
+void ARDUINO_ISR_ATTR onAudioTimer() {
   if (toneIsPlaying) {
-    // Advance phase accumulators
     phaseAcc350 += phaseInc350;
     phaseAcc440 += phaseInc440;
 
-    // Fetch sample values from sine table using upper 8 bits of accumulator
     uint8_t sample1 = sineTable[phaseAcc350 >> 24];
     uint8_t sample2 = sineTable[phaseAcc440 >> 24];
-
-    // Mathematically sum both sine waves and scale to 8-bit PWM range (0-255)
     uint8_t mixedSample = (sample1 >> 1) + (sample2 >> 1);
 
-    // Update hardware PWM duty cycle on GPIO 25
-    ledcWrite(PWM_CHANNEL, mixedSample);
+    ledcWrite(audioPin, mixedSample);
   } else {
-    // Mute output (center scale 128 to avoid DC click)
-    ledcWrite(PWM_CHANNEL, 128);
+    ledcWrite(audioPin, 128);
   }
 }
 
-// Interrupt Service Routine for Rotary Pulses
-void IRAM_ATTR countPulse() {
+// BUGFIXED ISR: Verifies pin state and uses FALLING break edge with 15ms window
+void ARDUINO_ISR_ATTR countPulse() {
   unsigned long currentTime = millis();
   if ((currentTime - lastDebounceTime) > debounceDelay) {
-    pulseCount++;
-    lastPulseTime = currentTime;
-    lastDebounceTime = currentTime;
+    // Confirm the pulse break is real (NC switch pulled HIGH on break)
+    if (digitalRead(dialPulsePin) == HIGH) {
+      pulseCount++;
+      lastPulseTime = currentTime;
+      lastDebounceTime = currentTime;
+    }
   }
 }
 
 void blinkDigit(int count);
 
 void setup() {
-  // 1. Initialize Serial Debugging
   Serial.begin(115200);
   delay(500);
-  Serial.println("\n--- ESP32 Candlestick Phone Controller Initializing ---");
+  Serial.println("\n--- ESP32 Candlestick Phone Controller (Pulse Engine v2) ---");
 
-  // 2. Configure Hardware Inputs
   pinMode(dialPulsePin, INPUT_PULLUP);
   pinMode(hookPin, INPUT_PULLUP);
   pinMode(dialStartPin, INPUT_PULLUP);
@@ -117,20 +101,13 @@ void setup() {
   pinMode(statusLed, OUTPUT);
   digitalWrite(statusLed, LOW);
 
-  // 3. Configure Single-Pin Audio PWM (LEDC)
-  ledcSetup(PWM_CHANNEL, PWM_FREQ, PWM_RESOLUTION);
-  ledcAttachPin(audioPin, PWM_CHANNEL);
-  ledcWrite(PWM_CHANNEL, 128); // Initialize at zero-crossing offset
+  ledcAttach(audioPin, PWM_FREQ, PWM_RESOLUTION);
+  ledcWrite(audioPin, 128);
 
-  // 4. Configure Hardware Timer for 8 kHz Audio Interrupt
-  // ESP32 APB clock is 80 MHz -> Prescaler 80 gives 1 MHz timer clock (1 µs per tick)
-  audioTimer = timerBegin(0, 80, true);
-  timerAttachInterrupt(audioTimer, &onAudioTimer, true);
-  // Trigger every 125 ticks (1000000 µs / 125 = 8000 Hz)
-  timerAlarmWrite(audioTimer, 125, true);
-  timerAlarmEnable(audioTimer);
+  audioTimer = timerBegin(SAMPLE_RATE);
+  timerAttachInterrupt(audioTimer, &onAudioTimer);
 
-  // 5. Attach Rotary Pulse Interrupt
+  // Trigger on RISING edge (when NC switch opens and pin goes HIGH)
   attachInterrupt(digitalPinToInterrupt(dialPulsePin), countPulse, RISING);
 
   Serial.println("[SYSTEM] Hardware and DDS Audio Engine Ready.");
@@ -145,14 +122,12 @@ void loop() {
   // -----------------------------------------------------------------
   if (currentHookState) {
     
-    // Handset was just lifted
     if (!phoneOffHook) {
       phoneOffHook = true;
       digitalWrite(statusLed, HIGH);
       
-      Serial.println("\n[HOOK] Handset LIFTED (Off-Hook). Starting dual dial tone (350 Hz + 440 Hz)...");
+      Serial.println("\n[HOOK] Handset LIFTED (Off-Hook). Starting dial tone...");
       
-      // Reset DDS phases and enable tone generator
       portENTER_CRITICAL(&timerMux);
       phaseAcc350 = 0;
       phaseAcc440 = 0;
@@ -166,14 +141,13 @@ void loop() {
     if (currentWheelState && !dialWheelActive) {
       dialWheelActive = true;
       
-      // Clear wind-up noise pulses
+      // Clear wind-up noise
       portENTER_CRITICAL(&timerMux);
       pulseCount = 0;
       portEXIT_CRITICAL(&timerMux);
       
-      Serial.println("[DIAL] Wheel pulled off rest position (Pin 21 LOW).");
+      Serial.println("[DIAL] Wheel pulled off rest position.");
 
-      // Cut dial tone immediately on single output pin
       if (toneIsPlaying) {
         portENTER_CRITICAL(&timerMux);
         toneIsPlaying = false;
@@ -189,31 +163,32 @@ void loop() {
     }
 
     // ---------------------------------------------------------------
-    // 3. DIGIT COMPLETE CHECK
+    // 3. DIGIT COMPLETE CHECK (DUAL-CONDITION TERMINATION)
     // ---------------------------------------------------------------
     int currentCount = 0;
     unsigned long timeSinceLastPulse = 0;
+    unsigned long localLastPulse = 0;
 
     portENTER_CRITICAL(&timerMux);
     currentCount = pulseCount;
-    if (currentCount > 0) {
-      timeSinceLastPulse = millis() - lastPulseTime;
-    }
+    localLastPulse = lastPulseTime;
     portEXIT_CRITICAL(&timerMux);
 
-    if (currentCount > 0 && timeSinceLastPulse > dialTimeout) {
+    if (currentCount > 0) {
+      timeSinceLastPulse = millis() - localLastPulse;
       
-      // Atomically reset pulseCount before processing
-      portENTER_CRITICAL(&timerMux);
-      pulseCount = 0;
-      portEXIT_CRITICAL(&timerMux);
+      // Commit digit if timeout reached OR wheel has snapped back to rest position
+      if (timeSinceLastPulse > dialTimeout || (!currentWheelState && timeSinceLastPulse > 100)) {
+        
+        portENTER_CRITICAL(&timerMux);
+        pulseCount = 0;
+        portEXIT_CRITICAL(&timerMux);
 
-      // Translate 10 pulses to '0' for serial debugging
-      int displayDigit = (currentCount == 10) ? 0 : currentCount;
-      Serial.printf("[DIAL] Digit Complete! Raw Pulses: %d -> Dialed Number: %d\n", currentCount, displayDigit);
+        int displayDigit = (currentCount == 10) ? 0 : currentCount;
+        Serial.printf("[DIAL] Digit Complete! Raw Pulses: %d -> Dialed Number: %d\n", currentCount, displayDigit);
 
-      // Signal dialed count back on onboard LED
-      blinkDigit(currentCount);
+        blinkDigit(currentCount);
+      }
     }
 
   } else {
@@ -235,7 +210,6 @@ void loop() {
   }
 }
 
-// Rapid-fire blink function for visual feedback
 void blinkDigit(int count) {
   for (int i = 0; i < count; i++) {
     digitalWrite(statusLed, HIGH);
