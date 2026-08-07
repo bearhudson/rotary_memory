@@ -2,7 +2,7 @@
 #include <Freenove_WS2812_Lib_for_ESP32.h>
 
 // ==========================================
-// PIN & LED DEFINITIONS (REMAPPED)
+// PIN & LED DEFINITIONS (WROOM REMAPPED)
 // ==========================================
 const uint8_t DIAL_PIN  = 16; // RX2
 const uint8_t HOOK_PIN  = 17; // TX2
@@ -23,6 +23,9 @@ ColorRGB pixelCanvas[NUM_LEDS];
 
 // Track actual rendered RGB levels for seamless fade transitions
 ColorRGB currentRenderedRGB = { 0.0f, 0.0f, 0.0f };
+
+// Stores the randomized color palette generated per dialing sequence
+ColorRGB currentSessionPalette[10];
 
 // ==========================================
 // PARTICLE ENGINE DATA STRUCTURES
@@ -67,7 +70,7 @@ const unsigned long DEBOUNCE_MS   = 10;
 const unsigned long DIGIT_GAP_MS  = 250;
 const unsigned long NUMBER_GAP_MS = 3000;
 
-const unsigned long DIGIT_SPAWN_GAP_MS = 1000; // 1-second constant delay between digit spawns
+const unsigned long DIGIT_SPAWN_GAP_MS = 1000; // 1-second delay between digit spawns
 
 const bool DEBUG = true;
 
@@ -102,6 +105,10 @@ bool lastShuntState = false;
 // Animation Tracking
 unsigned long fadeStartMillis = 0;
 const unsigned long FADE_DURATION_MS = 300;
+
+// ==========================================
+// COLOR HELPER FUNCTIONS
+// ==========================================
 
 // Helper RGB set
 void setRingColorRGB(uint8_t r, uint8_t g, uint8_t b) {
@@ -157,6 +164,28 @@ ColorRGB hsvToRgb(uint8_t h, uint8_t s, uint8_t v) {
 
   return { (r * MAX_BRIGHT) / 255.0f, (g * MAX_BRIGHT) / 255.0f, (b * MAX_BRIGHT) / 255.0f };
 }
+
+// Generates 10 distinct, vibrant random colors mapped to digits 0-9 for the current sequence
+void randomizeSessionPalette() {
+  uint8_t startHue = random(0, 256);
+  for (int i = 0; i < 10; i++) {
+    uint8_t hue = (startHue + (i * 25) + random(-5, 6)) % 256;
+    currentSessionPalette[i] = hsvToRgb(hue, 255, 255);
+  }
+}
+
+// Retrieves the session-assigned color for a specific digit character
+ColorRGB getDigitColor(char digitChar) {
+  if (digitChar >= '0' && digitChar <= '9') {
+    int digit = digitChar - '0';
+    return currentSessionPalette[digit];
+  }
+  return { (float)MAX_BRIGHT, (float)MAX_BRIGHT, (float)MAX_BRIGHT }; // Fallback
+}
+
+// ==========================================
+// SWEEP & FADE ANIMATIONS
+// ==========================================
 
 // Sweep on shunt pull
 void runCounterClockwiseSweep(uint8_t r, uint8_t g, uint8_t b, uint16_t frameDelay = 6) {
@@ -217,29 +246,6 @@ void runHookStateFade(uint8_t targetR, uint8_t targetG, uint8_t targetB, unsigne
   setRingColorRGB(targetR, targetG, targetB);
 }
 
-// Color generator (Vibrant random colors)
-ColorRGB getRandomVibrantColor() {
-  uint8_t h = random(0, 256);
-  uint8_t region = h / 43;
-  uint8_t remainder = (h - (region * 43)) * 6;
-
-  uint8_t p = 0;
-  uint8_t q = 255 - remainder;
-  uint8_t t = remainder;
-
-  float r, g, b;
-  switch (region) {
-    case 0:  r = 255; g = t;   b = p;   break;
-    case 1:  r = q;   g = 255; b = p;   break;
-    case 2:  r = p;   g = 255; b = t;   break;
-    case 3:  r = p;   g = q;   b = 255; break;
-    case 4:  r = t;   g = p;   b = 255; break;
-    default: r = 255; g = p;   b = q;   break;
-  }
-
-  return { (r * MAX_BRIGHT) / 255.0f, (g * MAX_BRIGHT) / 255.0f, (b * MAX_BRIGHT) / 255.0f };
-}
-
 // ==========================================
 // PARTICLE SYSTEM ENGINE
 // ==========================================
@@ -253,7 +259,7 @@ void spawnParticle(char digitChar, ColorRGB forcedColor = { -1.0f, -1.0f, -1.0f 
       if (forcedColor.r >= 0.0f) {
         particles[i].color = forcedColor;
       } else {
-        particles[i].color = getRandomVibrantColor();
+        particles[i].color = getDigitColor(digitChar);
       }
 
       particles[i].pos = random(0, NUM_LEDS);
@@ -272,8 +278,8 @@ void spawnParticle(char digitChar, ColorRGB forcedColor = { -1.0f, -1.0f, -1.0f 
       particles[i].popRadius = 0;
 
       if (DEBUG && forcedColor.r < 0.0f) {
-        Serial.printf("Spawned [%c] @ Slot %d | Speed Rating: %d/10 | Lifetime: %lu ms | Direction: %s\n",
-                      digitChar, i, speedRating, particles[i].lifetimeMs, (particles[i].direction > 0 ? "CW" : "CCW"));
+        Serial.printf("Spawned [%c] @ Slot %d | Speed Rating: %d/10 | Lifetime: %lu ms\n",
+                      digitChar, i, speedRating, particles[i].lifetimeMs);
       }
       break;
     }
@@ -591,6 +597,9 @@ void runZeroEasterEgg() {
   }
 }
 
+// ==========================================
+// ARDUINO SETUP & MAIN LOOP
+// ==========================================
 void setup() {
   Serial.begin(115200);
 
@@ -616,7 +625,7 @@ void setup() {
     currentSystemState = STATE_IDLE_PULSE;
   }
 
-  Serial.println("\n[SYSTEM] Rotary Controller Ready (Pure Pulse & LED Logic).");
+  Serial.println("\n[SYSTEM] Rotary Controller Ready.");
 }
 
 void loop() {
@@ -718,6 +727,9 @@ void loop() {
   if (numberPending && !dialActive && (now - lastPulseMillis) >= NUMBER_GAP_MS) {
     Serial.print("\nNumber dialed: ");
     Serial.println(dialedNumber);
+
+    // --- GENERATE A NEW RANDOM COLOR MAP FOR THIS DIALED SEQUENCE ---
+    randomizeSessionPalette();
 
     // --- EASTER EGG ROUTING ---
     if (dialedNumber == "911") {
