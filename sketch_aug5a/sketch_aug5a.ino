@@ -2,12 +2,12 @@
 #include <Freenove_WS2812_Lib_for_ESP32.h>
 
 // ==========================================
-// PIN & LED DEFINITIONS
+// PIN & LED DEFINITIONS (REMAPPED)
 // ==========================================
-const uint8_t DIAL_PIN  = 18;
-const uint8_t HOOK_PIN  = 19;
-const uint8_t SHUNT_PIN = 21;
-const uint8_t LED_PIN   = 23; // ESP32 Hardware RMT Pin
+const uint8_t DIAL_PIN  = 16; // RX2
+const uint8_t HOOK_PIN  = 17; // TX2
+const uint8_t SHUNT_PIN = 21; // SDA
+const uint8_t LED_PIN   = 22; // SCL
 
 #define NUM_LEDS     32   // 32-Pixel NeoPixel Ring
 #define MAX_BRIGHT   128  // Half intensity ceiling (0-255)
@@ -48,6 +48,16 @@ struct Particle {
 
 Particle particles[MAX_PARTICLES];
 
+// Star structure for Option 2 Night Sky Twinkle
+struct Star {
+  bool active = false;
+  float brightness = 0.0f;
+  float fadeSpeed = 0.02f;
+  int state = 0; // 0 = Fading In, 1 = Fading Out
+};
+
+Star starSky[NUM_LEDS];
+
 // ==========================================
 // TIMING & DIAL PARAMETERS
 // ==========================================
@@ -81,7 +91,8 @@ enum PhoneState {
   STATE_DIALING_SOLID,
   STATE_DIGIT_FADE,
   STATE_PLAYBACK,
-  STATE_RED_ALERT
+  STATE_RED_ALERT,
+  STATE_EASTER_EGG_ZERO
 };
 
 PhoneState currentSystemState = STATE_IDLE_PULSE;
@@ -117,6 +128,34 @@ void clearCanvas() {
   }
   strip.setAllLedsColor(0, 0, 0);
   currentRenderedRGB = { 0.0f, 0.0f, 0.0f };
+}
+
+// Convert Integer HSV (0-255) to RGB ColorRGB
+ColorRGB hsvToRgb(uint8_t h, uint8_t s, uint8_t v) {
+  uint8_t region, remainder, p, q, t;
+  uint8_t r, g, b;
+
+  if (s == 0) {
+    r = g = b = v;
+  } else {
+    region = h / 43;
+    remainder = (h - (region * 43)) * 6;
+
+    p = (v * (255 - s)) >> 8;
+    q = (v * (255 - ((s * remainder) >> 8))) >> 8;
+    t = (v * (255 - ((s * (255 - remainder)) >> 8))) >> 8;
+
+    switch (region) {
+      case 0:  r = v; g = t; b = p; break;
+      case 1:  r = q; g = v; b = p; break;
+      case 2:  r = p; g = v; b = t; break;
+      case 3:  r = p; g = q; b = v; break;
+      case 4:  r = t; g = p; b = v; break;
+      default: r = v; g = p; b = q; break;
+    }
+  }
+
+  return { (r * MAX_BRIGHT) / 255.0f, (g * MAX_BRIGHT) / 255.0f, (b * MAX_BRIGHT) / 255.0f };
 }
 
 // Sweep on shunt pull
@@ -211,7 +250,6 @@ void spawnParticle(char digitChar, ColorRGB forcedColor = { -1.0f, -1.0f, -1.0f 
       particles[i].phase = PHASE_SPARKLE;
       particles[i].digitChar = digitChar;
       
-      // Use forced color if provided (e.g. Red Alert), otherwise pick random
       if (forcedColor.r >= 0.0f) {
         particles[i].color = forcedColor;
       } else {
@@ -426,20 +464,16 @@ void playbackSequence(String sequence) {
 void runRedAlertSwarm() {
   if (DEBUG) Serial.println("\n[RED ALERT] Launching 16-Pixel Red Particle Swarm...");
 
-  // 1. Clear current particles and canvas
   for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
   clearCanvas();
 
   ColorRGB pureRed = { (float)MAX_BRIGHT, 0.0f, 0.0f };
 
-  // 2. Spawn 16 red particles at once
   for (int p = 0; p < 16; p++) {
     spawnParticle('!', pureRed);
   }
 
-  // 3. Continuous Orbit Loop (Ignores dialer input until handset is replaced)
   while (digitalRead(HOOK_PIN) == LOW) {
-    // Keep particle count replenished to 16 if particles pop
     while (countActiveParticles() < 16) {
       spawnParticle('!', pureRed);
     }
@@ -449,6 +483,112 @@ void runRedAlertSwarm() {
   }
 
   if (DEBUG) Serial.println("[RED ALERT] Handset replaced. Ending Swarm.");
+}
+
+// ==========================================
+// OPTION 1: HEARTBEAT HSL WALK ENGINE
+// ==========================================
+void runHeartbeatHslWalk() {
+  if (DEBUG) Serial.println("\n[EASTER EGG 0] Option 1: Heartbeat HSL Walk Selected");
+
+  uint8_t currentHue = random(0, 256);
+  uint8_t currentSat = random(180, 255);
+  int hueDirection = (random(0, 2) == 0) ? 1 : -1;
+
+  unsigned long cycleStart = millis();
+
+  while (digitalRead(HOOK_PIN) == LOW) {
+    unsigned long elapsed = (millis() - cycleStart) % 1200;
+
+    currentHue += hueDirection * 1;
+
+    float pulseVal = 0.05f;
+    if (elapsed < 150) {
+      pulseVal = 0.05f + 0.95f * (sin((float)elapsed / 150.0f * PI));
+    } else if (elapsed >= 220 && elapsed < 420) {
+      pulseVal = 0.05f + 0.60f * (sin((float)(elapsed - 220) / 200.0f * PI));
+    }
+
+    uint8_t targetValue = (uint8_t)(pulseVal * 220);
+    ColorRGB hsvColor = hsvToRgb(currentHue, currentSat, targetValue);
+
+    setRingColorRGB((uint8_t)hsvColor.r, (uint8_t)hsvColor.g, (uint8_t)hsvColor.b);
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+}
+
+// ==========================================
+// OPTION 2: NIGHT SKY STAR TWINKLE ENGINE
+// ==========================================
+void runNightSkyTwinkle() {
+  if (DEBUG) Serial.println("\n[EASTER EGG 0] Option 2: Night Sky Star Twinkle Selected");
+
+  for (int i = 0; i < NUM_LEDS; i++) {
+    starSky[i].active = false;
+    starSky[i].brightness = 0.0f;
+  }
+
+  ColorRGB startRGB = currentRenderedRGB;
+  for (int f = 0; f < 20; f++) {
+    float prog = (float)f / 20.0f;
+    setRingColorRGB((uint8_t)(startRGB.r * (1.0f - prog)), 
+                    (uint8_t)(startRGB.g * (1.0f - prog)), 
+                    (uint8_t)(startRGB.b * (1.0f - prog)));
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+  clearCanvas();
+
+  while (digitalRead(HOOK_PIN) == LOW) {
+    if (random(0, 100) < 15) {
+      int idx = random(0, NUM_LEDS);
+      if (!starSky[idx].active) {
+        starSky[idx].active = true;
+        starSky[idx].brightness = 0.0f;
+        starSky[idx].fadeSpeed = random(5, 25) / 1000.0f;
+        starSky[idx].state = 0;
+      }
+    }
+
+    for (int i = 0; i < NUM_LEDS; i++) {
+      if (starSky[i].active) {
+        if (starSky[i].state == 0) {
+          starSky[i].brightness += starSky[i].fadeSpeed;
+          if (starSky[i].brightness >= 1.0f) {
+            starSky[i].brightness = 1.0f;
+            starSky[i].state = 1;
+          }
+        } else {
+          starSky[i].brightness -= starSky[i].fadeSpeed;
+          if (starSky[i].brightness <= 0.0f) {
+            starSky[i].brightness = 0.0f;
+            starSky[i].active = false;
+          }
+        }
+
+        float bFactor = starSky[i].brightness;
+        uint8_t r = (uint8_t)(MAX_BRIGHT * bFactor);
+        uint8_t g = (uint8_t)(MAX_BRIGHT * 0.82f * bFactor);
+        uint8_t b = (uint8_t)(MAX_BRIGHT * 0.45f * bFactor);
+
+        strip.setLedColorData(i, r, g, b);
+      } else {
+        strip.setLedColorData(i, 0, 0, 0);
+      }
+    }
+
+    strip.show();
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+
+// Master router for 0 easter egg
+void runZeroEasterEgg() {
+  int choice = random(0, 2);
+  if (choice == 0) {
+    runHeartbeatHslWalk();
+  } else {
+    runNightSkyTwinkle();
+  }
 }
 
 void setup() {
@@ -469,13 +609,14 @@ void setup() {
   lastHookState  = (digitalRead(HOOK_PIN) == LOW);
   lastShuntState = (digitalRead(SHUNT_PIN) == LOW);
 
-  currentSystemState = lastHookState ? STATE_OFF_HOOK : STATE_IDLE_PULSE;
-
   if (lastHookState) {
+    currentSystemState = STATE_OFF_HOOK;
     setRingColorRGB(0, MAX_BRIGHT, 0);
+  } else {
+    currentSystemState = STATE_IDLE_PULSE;
   }
 
-  Serial.println("\n[SYSTEM] Rotary Controller Ready (Red Swarm Easter Egg).");
+  Serial.println("\n[SYSTEM] Rotary Controller Ready (Pure Pulse & LED Logic).");
 }
 
 void loop() {
@@ -494,9 +635,8 @@ void loop() {
       runHookStateFade(0, MAX_BRIGHT, 0, 250, true);
       currentSystemState = STATE_OFF_HOOK;
     } else {
-      if (DEBUG) Serial.println("\n[HOOK] Handset REPLACED -> FULL RESET to Ambient Yellow");
+      if (DEBUG) Serial.println("\n[HOOK] Handset REPLACED -> Ambient Yellow");
       
-      // Clear particle memory on hook replacement
       for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
       
       uint8_t targetR = (uint8_t)(255 * 0.12f * (MAX_BRIGHT / 255.0f));
@@ -515,7 +655,7 @@ void loop() {
   }
 
   // 3. SHUNT MONITORING (Pull Sweep & Release Pulse)
-  if (hookOffCradle && currentSystemState != STATE_PLAYBACK && currentSystemState != STATE_RED_ALERT) {
+  if (hookOffCradle && currentSystemState != STATE_PLAYBACK && currentSystemState != STATE_RED_ALERT && currentSystemState != STATE_EASTER_EGG_ZERO) {
     if (shuntFlipped && !lastShuntState) {
       if (DEBUG) Serial.println("[SHUNT] Wheel pulled -> Trigger CCW Sweep");
       runCounterClockwiseSweep(0, 0, MAX_BRIGHT, 6);
@@ -543,7 +683,7 @@ void loop() {
         dialActive = true;
         lastPulseMillis = now;
 
-        if (hookOffCradle && currentSystemState != STATE_DIALING_SWEEP && currentSystemState != STATE_RED_ALERT) {
+        if (hookOffCradle && currentSystemState != STATE_DIALING_SWEEP && currentSystemState != STATE_RED_ALERT && currentSystemState != STATE_EASTER_EGG_ZERO) {
           currentSystemState = STATE_DIALING_SOLID;
         }
 
@@ -566,7 +706,7 @@ void loop() {
       dialedNumber += String(digit);
       numberPending = true;
 
-      if (hookOffCradle && currentSystemState != STATE_RED_ALERT) {
+      if (hookOffCradle && currentSystemState != STATE_RED_ALERT && currentSystemState != STATE_EASTER_EGG_ZERO) {
         currentSystemState = STATE_DIGIT_FADE;
         fadeStartMillis = now;
       }
@@ -582,7 +722,7 @@ void loop() {
     // --- EASTER EGG ROUTING ---
     if (dialedNumber == "911") {
       currentSystemState = STATE_RED_ALERT;
-      runRedAlertSwarm(); // Swarms 16 red particles until receiver is replaced
+      runRedAlertSwarm();
 
       if (digitalRead(HOOK_PIN) == LOW) {
         currentSystemState = STATE_OFF_HOOK;
@@ -590,6 +730,16 @@ void loop() {
         currentSystemState = STATE_IDLE_PULSE;
       }
     } 
+    else if (dialedNumber == "0") {
+      currentSystemState = STATE_EASTER_EGG_ZERO;
+      runZeroEasterEgg();
+
+      if (digitalRead(HOOK_PIN) == LOW) {
+        currentSystemState = STATE_OFF_HOOK;
+      } else {
+        currentSystemState = STATE_IDLE_PULSE;
+      }
+    }
     else {
       currentSystemState = STATE_PLAYBACK;
       playbackSequence(dialedNumber);
@@ -608,7 +758,6 @@ void loop() {
   // 6. LIGHT ENGINE
   switch (currentSystemState) {
     case STATE_IDLE_PULSE: {
-      // Ultra-slow Warm Soft Yellow Glow (10,000ms / 10-second period)
       float breathVal = 0.12f + 0.88f * ((sin((float)now / 10000.0f * 2.0f * PI) + 1.0f) / 2.0f);
       
       uint8_t r = (uint8_t)(255 * breathVal * (MAX_BRIGHT / 255.0f));
@@ -628,10 +777,9 @@ void loop() {
       break;
 
     case STATE_DIGIT_FADE: {
-      // Fades out from Dialing Blue to Black after dialing stops
       unsigned long elapsed = now - fadeStartMillis;
       if (elapsed >= FADE_DURATION_MS) {
-        setRingColorRGB(0, 0, 0); // Complete fade to black
+        setRingColorRGB(0, 0, 0); // Fade to black
       } else {
         float progress = (float)elapsed / (float)FADE_DURATION_MS;
         uint8_t b = (uint8_t)(MAX_BRIGHT * (1.0f - progress));
@@ -641,6 +789,7 @@ void loop() {
     }
 
     case STATE_RED_ALERT:
+    case STATE_EASTER_EGG_ZERO:
     case STATE_DIALING_SWEEP:
     case STATE_PLAYBACK:
       break;
