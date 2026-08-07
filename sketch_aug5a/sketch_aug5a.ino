@@ -1,220 +1,648 @@
 #include <Arduino.h>
+#include <Freenove_WS2812_Lib_for_ESP32.h>
 
 // ==========================================
-// PIN DEFINITIONS (ESP32)
+// PIN & LED DEFINITIONS
 // ==========================================
-const int dialPulsePin = 18;  // Rotary pulse switch (NC, to GND)
-const int hookPin      = 19;  // Receiver hook switch (NO, to GND)
-const int dialStartPin = 21;  // Rotary wheel off-rest switch (to GND)
-const int audioPin     = 25;  // Single-pin summed audio out
-const int statusLed    = 2;   // Onboard LED (GPIO 2)
+const uint8_t DIAL_PIN  = 18;
+const uint8_t HOOK_PIN  = 19;
+const uint8_t SHUNT_PIN = 21;
+const uint8_t LED_PIN   = 23; // ESP32 Hardware RMT Pin
 
-// ==========================================
-// ROTARY PULSE TRACKING (BUGFIXED TIMINGS)
-// ==========================================
-volatile int pulseCount = 0;
-volatile unsigned long lastPulseTime = 0;
-volatile unsigned long lastDebounceTime = 0;
-const unsigned long debounceDelay = 15; // 15ms is optimal for 10Hz rotary leaf switches
-const unsigned long dialTimeout   = 350; // 350ms window after last pulse
+#define NUM_LEDS     32   // 32-Pixel NeoPixel Ring
+#define MAX_BRIGHT   128  // Half intensity ceiling (0-255)
+#define MAX_PARTICLES 20  // Max simultaneous digits/particles on the ring
 
-// ==========================================
-// HARDWARE STATE VARIABLES
-// ==========================================
-bool phoneOffHook    = false;
-bool dialWheelActive = false;
-bool toneIsPlaying   = false;
+Freenove_ESP32_WS2812 strip(NUM_LEDS, LED_PIN, 0, TYPE_GRB);
 
-// ==========================================
-// SOFTWARE DDS AUDIO SYNTHESIS
-// ==========================================
-#define PWM_FREQ       62500  
-#define PWM_RESOLUTION 8      
-#define SAMPLE_RATE    8000   
-
-hw_timer_t *audioTimer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-
-const uint8_t PROGMEM sineTable[256] = {
-  128, 131, 134, 137, 140, 143, 146, 149, 152, 155, 158, 162, 165, 167, 170, 173,
-  176, 179, 182, 185, 188, 190, 193, 196, 198, 201, 203, 206, 208, 211, 213, 215,
-  218, 220, 222, 224, 226, 228, 230, 232, 234, 235, 237, 238, 240, 241, 243, 244,
-  245, 246, 247, 248, 249, 250, 250, 251, 252, 252, 252, 253, 253, 253, 253, 253,
-  252, 252, 252, 251, 250, 250, 249, 248, 247, 246, 245, 244, 243, 241, 240, 238,
-  237, 235, 234, 232, 230, 228, 226, 224, 222, 220, 218, 215, 213, 211, 208, 206,
-  203, 201, 198, 196, 193, 190, 188, 185, 182, 179, 176, 173, 170, 167, 165, 162,
-  158, 155, 152, 149, 146, 143, 140, 137, 134, 131, 128, 124, 121, 118, 115, 112,
-  109, 106, 103, 100, 97,  93,  90,  88,  85,  82,  79,  76,  73,  70,  67,  65,
-  62,  59,  57,  54,  52,  49,  47,  44,  42,  40,  37,  35,  33,  31,  29,  27,
-  25,  23,  21,  20,  18,  17,  15,  14,  12,  11,  10,  9,   8,   7,   6,   5,
-  5,   4,   3,   3,   3,   2,   2,   2,   2,   2,   3,   3,   3,   4,   5,   5,
-  6,   7,   8,   9,   10,  11,  12,  14,  15,  17,  18,  20,  21,  23,  25,  27,
-  29,  31,  33,  35,  37,  40,  42,  44,  47,  49,  52,  54,  57,  59,  62,  65,
-  67,  70,  73,  76,  79,  82,  85,  88,  90,  93,  97,  100, 103, 106, 109, 112,
-  115, 118, 121, 124
+struct ColorRGB {
+  float r, g, b;
 };
 
-volatile uint32_t phaseAcc350 = 0;
-volatile uint32_t phaseAcc440 = 0;
-const uint32_t phaseInc350 = (350ULL * 4294967296ULL) / SAMPLE_RATE;
-const uint32_t phaseInc440 = (440ULL * 4294967296ULL) / SAMPLE_RATE;
+ColorRGB pixelCanvas[NUM_LEDS];
 
-void ARDUINO_ISR_ATTR onAudioTimer() {
-  if (toneIsPlaying) {
-    phaseAcc350 += phaseInc350;
-    phaseAcc440 += phaseInc440;
+// Track actual rendered RGB levels for seamless fade transitions
+ColorRGB currentRenderedRGB = { 0.0f, 0.0f, 0.0f };
 
-    uint8_t sample1 = sineTable[phaseAcc350 >> 24];
-    uint8_t sample2 = sineTable[phaseAcc440 >> 24];
-    uint8_t mixedSample = (sample1 >> 1) + (sample2 >> 1);
+// ==========================================
+// PARTICLE ENGINE DATA STRUCTURES
+// ==========================================
+enum ParticlePhase { PHASE_INACTIVE, PHASE_SPARKLE, PHASE_ORBIT, PHASE_POP };
 
-    ledcWrite(audioPin, mixedSample);
-  } else {
-    ledcWrite(audioPin, 128);
+struct Particle {
+  bool active = false;
+  ParticlePhase phase = PHASE_INACTIVE;
+  char digitChar;
+  
+  ColorRGB color;
+  float pos;
+  int direction;           // +1 (CW) or -1 (CCW)
+  float speed;             // Calculated angular velocity
+  float decayRate;         // Individual trail decay (0.75 - 0.92)
+  unsigned long lifetimeMs; // Lifetime inverse to speed (5,000ms - 20,000ms)
+  unsigned long sparkleDurationMs; // Sparkle duration (100ms - 400ms)
+  
+  unsigned long phaseStartMillis;
+  int popRadius;
+};
+
+Particle particles[MAX_PARTICLES];
+
+// ==========================================
+// TIMING & DIAL PARAMETERS
+// ==========================================
+int PULSE_LEVEL = LOW;
+
+const unsigned long DEBOUNCE_MS   = 10;
+const unsigned long DIGIT_GAP_MS  = 250;
+const unsigned long NUMBER_GAP_MS = 3000;
+
+const unsigned long DIGIT_SPAWN_GAP_MS = 1000; // 1-second constant delay between digit spawns
+
+const bool DEBUG = true;
+
+// --- Pulse Tracking Variables ---
+int stableState = HIGH;
+int lastReadState = HIGH;
+unsigned long lastChangeTime = 0;
+
+int pulseCount = 0;
+bool dialActive = false;
+unsigned long lastPulseMillis = 0;
+
+String dialedNumber = "";
+bool numberPending = false;
+
+// --- System State Machine ---
+enum PhoneState {
+  STATE_IDLE_PULSE,
+  STATE_OFF_HOOK,
+  STATE_DIALING_SWEEP,
+  STATE_DIALING_SOLID,
+  STATE_DIGIT_FADE,
+  STATE_PLAYBACK,
+  STATE_RED_ALERT
+};
+
+PhoneState currentSystemState = STATE_IDLE_PULSE;
+bool lastHookState = false;
+bool lastShuntState = false;
+
+// Animation Tracking
+unsigned long fadeStartMillis = 0;
+const unsigned long FADE_DURATION_MS = 300;
+
+// Helper RGB set
+void setRingColorRGB(uint8_t r, uint8_t g, uint8_t b) {
+  currentRenderedRGB = { (float)r, (float)g, (float)b };
+  for (int i = 0; i < NUM_LEDS; i++) {
+    pixelCanvas[i] = currentRenderedRGB;
   }
+  strip.setAllLedsColor(r, g, b);
 }
 
-// BUGFIXED ISR: Verifies pin state and uses FALLING break edge with 15ms window
-void ARDUINO_ISR_ATTR countPulse() {
-  unsigned long currentTime = millis();
-  if ((currentTime - lastDebounceTime) > debounceDelay) {
-    // Confirm the pulse break is real (NC switch pulled HIGH on break)
-    if (digitalRead(dialPulsePin) == HIGH) {
-      pulseCount++;
-      lastPulseTime = currentTime;
-      lastDebounceTime = currentTime;
+void renderCanvas() {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    uint8_t r = (uint8_t)constrain(pixelCanvas[i].r, 0, MAX_BRIGHT);
+    uint8_t g = (uint8_t)constrain(pixelCanvas[i].g, 0, MAX_BRIGHT);
+    uint8_t b = (uint8_t)constrain(pixelCanvas[i].b, 0, MAX_BRIGHT);
+    strip.setLedColorData(i, r, g, b);
+  }
+  strip.show();
+}
+
+void clearCanvas() {
+  for (int i = 0; i < NUM_LEDS; i++) {
+    pixelCanvas[i] = { 0.0f, 0.0f, 0.0f };
+  }
+  strip.setAllLedsColor(0, 0, 0);
+  currentRenderedRGB = { 0.0f, 0.0f, 0.0f };
+}
+
+// Sweep on shunt pull
+void runCounterClockwiseSweep(uint8_t r, uint8_t g, uint8_t b, uint16_t frameDelay = 6) {
+  for (int i = NUM_LEDS - 1; i >= 0; i--) {
+    if (digitalRead(HOOK_PIN) == HIGH) break;
+
+    strip.setAllLedsColor(0, 0, 0);
+    strip.setLedColorData(i, r, g, b);
+    strip.setLedColorData((i + 1) % NUM_LEDS, r / 2, g / 2, b / 2);
+    strip.setLedColorData((i + 2) % NUM_LEDS, r / 4, g / 4, b / 4);
+    strip.show();
+
+    vTaskDelay(pdMS_TO_TICKS(frameDelay));
+  }
+  setRingColorRGB(r, g, b);
+}
+
+// Single White Pulse on Shunt Release (Spin Finish)
+void runShuntReleasePulse() {
+  setRingColorRGB(MAX_BRIGHT, MAX_BRIGHT, MAX_BRIGHT);
+  vTaskDelay(pdMS_TO_TICKS(40));
+
+  unsigned long start = millis();
+  const unsigned long PULSE_FADE_MS = 150;
+
+  while (millis() - start < PULSE_FADE_MS) {
+    if (digitalRead(HOOK_PIN) == HIGH) break;
+
+    float progress = (float)(millis() - start) / (float)PULSE_FADE_MS;
+    uint8_t r = (uint8_t)(MAX_BRIGHT * (1.0f - progress));
+    uint8_t g = (uint8_t)(MAX_BRIGHT * (1.0f - progress));
+    uint8_t b = MAX_BRIGHT;
+
+    setRingColorRGB(r, g, b);
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  setRingColorRGB(0, 0, MAX_BRIGHT);
+}
+
+// Quick transition fade when lifting or replacing handset
+void runHookStateFade(uint8_t targetR, uint8_t targetG, uint8_t targetB, unsigned long fadeDurationMs, bool targetHookOff) {
+  ColorRGB startColor = currentRenderedRGB;
+  unsigned long start = millis();
+
+  while (millis() - start < fadeDurationMs) {
+    bool currentHookOff = (digitalRead(HOOK_PIN) == LOW);
+    if (currentHookOff != targetHookOff) break;
+
+    float progress = (float)(millis() - start) / (float)fadeDurationMs;
+
+    uint8_t r = (uint8_t)(startColor.r + ((targetR - startColor.r) * progress));
+    uint8_t g = (uint8_t)(startColor.g + ((targetG - startColor.g) * progress));
+    uint8_t b = (uint8_t)(startColor.b + ((targetB - startColor.b) * progress));
+
+    setRingColorRGB(r, g, b);
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  setRingColorRGB(targetR, targetG, targetB);
+}
+
+// Color generator (Vibrant random colors)
+ColorRGB getRandomVibrantColor() {
+  uint8_t h = random(0, 256);
+  uint8_t region = h / 43;
+  uint8_t remainder = (h - (region * 43)) * 6;
+
+  uint8_t p = 0;
+  uint8_t q = 255 - remainder;
+  uint8_t t = remainder;
+
+  float r, g, b;
+  switch (region) {
+    case 0:  r = 255; g = t;   b = p;   break;
+    case 1:  r = q;   g = 255; b = p;   break;
+    case 2:  r = p;   g = 255; b = t;   break;
+    case 3:  r = p;   g = q;   b = 255; break;
+    case 4:  r = t;   g = p;   b = 255; break;
+    default: r = 255; g = p;   b = q;   break;
+  }
+
+  return { (r * MAX_BRIGHT) / 255.0f, (g * MAX_BRIGHT) / 255.0f, (b * MAX_BRIGHT) / 255.0f };
+}
+
+// ==========================================
+// PARTICLE SYSTEM ENGINE
+// ==========================================
+void spawnParticle(char digitChar, ColorRGB forcedColor = { -1.0f, -1.0f, -1.0f }) {
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    if (!particles[i].active) {
+      particles[i].active = true;
+      particles[i].phase = PHASE_SPARKLE;
+      particles[i].digitChar = digitChar;
+      
+      // Use forced color if provided (e.g. Red Alert), otherwise pick random
+      if (forcedColor.r >= 0.0f) {
+        particles[i].color = forcedColor;
+      } else {
+        particles[i].color = getRandomVibrantColor();
+      }
+
+      particles[i].pos = random(0, NUM_LEDS);
+      particles[i].direction = (random(0, 2) == 0) ? 1 : -1;
+      
+      int speedRating = random(1, 11);
+      particles[i].speed = (speedRating * 0.4f) + random(1, 8) / 10.0f;
+
+      float normSpeed = (speedRating - 1.0f) / 9.0f;
+      particles[i].lifetimeMs = 20000 - (normSpeed * 15000);
+
+      particles[i].decayRate = 0.75f + (random(0, 18) / 100.0f);
+      particles[i].sparkleDurationMs = random(10, 41) * 10;
+
+      particles[i].phaseStartMillis = millis();
+      particles[i].popRadius = 0;
+
+      if (DEBUG && forcedColor.r < 0.0f) {
+        Serial.printf("Spawned [%c] @ Slot %d | Speed Rating: %d/10 | Lifetime: %lu ms | Direction: %s\n",
+                      digitChar, i, speedRating, particles[i].lifetimeMs, (particles[i].direction > 0 ? "CW" : "CCW"));
+      }
+      break;
     }
   }
 }
 
-void blinkDigit(int count);
+bool hasActiveParticles() {
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    if (particles[i].active) return true;
+  }
+  return false;
+}
+
+int countActiveParticles() {
+  int count = 0;
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    if (particles[i].active) count++;
+  }
+  return count;
+}
+
+void updateAndRenderParticles() {
+  unsigned long now = millis();
+
+  for (int i = 0; i < MAX_PARTICLES; i++) {
+    if (!particles[i].active) continue;
+
+    unsigned long elapsed = now - particles[i].phaseStartMillis;
+
+    for (int p = 0; p < NUM_LEDS; p++) {
+      pixelCanvas[p].r *= particles[i].decayRate;
+      pixelCanvas[p].g *= particles[i].decayRate;
+      pixelCanvas[p].b *= particles[i].decayRate;
+    }
+
+    switch (particles[i].phase) {
+      case PHASE_SPARKLE: {
+        if (elapsed >= particles[i].sparkleDurationMs) {
+          particles[i].phase = PHASE_ORBIT;
+          particles[i].phaseStartMillis = now;
+        } else {
+          int sparkleIdx = random(0, NUM_LEDS);
+          pixelCanvas[sparkleIdx].r = max(pixelCanvas[sparkleIdx].r, particles[i].color.r * 0.8f);
+          pixelCanvas[sparkleIdx].g = max(pixelCanvas[sparkleIdx].g, particles[i].color.g * 0.8f);
+          pixelCanvas[sparkleIdx].b = max(pixelCanvas[sparkleIdx].b, particles[i].color.b * 0.8f);
+        }
+        break;
+      }
+
+      case PHASE_ORBIT: {
+        if (elapsed >= particles[i].lifetimeMs) {
+          particles[i].phase = PHASE_POP;
+          particles[i].phaseStartMillis = now;
+          particles[i].popRadius = 0;
+        } else {
+          particles[i].pos += (particles[i].direction * (particles[i].speed / 10.0f));
+          if (particles[i].pos >= NUM_LEDS) particles[i].pos -= NUM_LEDS;
+          if (particles[i].pos < 0)         particles[i].pos += NUM_LEDS;
+
+          int currentIdx = (int)particles[i].pos;
+          int nextIdx = (currentIdx + 1) % NUM_LEDS;
+          float frac = particles[i].pos - currentIdx;
+
+          pixelCanvas[currentIdx].r = max(pixelCanvas[currentIdx].r, particles[i].color.r * (1.0f - frac));
+          pixelCanvas[currentIdx].g = max(pixelCanvas[currentIdx].g, particles[i].color.g * (1.0f - frac));
+          pixelCanvas[currentIdx].b = max(pixelCanvas[currentIdx].b, particles[i].color.b * (1.0f - frac));
+
+          pixelCanvas[nextIdx].r = max(pixelCanvas[nextIdx].r, particles[i].color.r * frac);
+          pixelCanvas[nextIdx].g = max(pixelCanvas[nextIdx].g, particles[i].color.g * frac);
+          pixelCanvas[nextIdx].b = max(pixelCanvas[nextIdx].b, particles[i].color.b * frac);
+        }
+        break;
+      }
+
+      case PHASE_POP: {
+        int centerIdx = (int)particles[i].pos;
+        int radius = particles[i].popRadius;
+
+        if (radius > NUM_LEDS / 2) {
+          particles[i].active = false;
+          particles[i].phase = PHASE_INACTIVE;
+        } else {
+          int leftWing  = (centerIdx - radius + NUM_LEDS) % NUM_LEDS;
+          int rightWing = (centerIdx + radius) % NUM_LEDS;
+
+          float brightnessFactor = 1.0f - ((float)radius / (NUM_LEDS / 2.0f));
+          ColorRGB burstColor = { 
+            particles[i].color.r * brightnessFactor, 
+            particles[i].color.g * brightnessFactor, 
+            particles[i].color.b * brightnessFactor 
+          };
+
+          pixelCanvas[leftWing].r  = max(pixelCanvas[leftWing].r, burstColor.r);
+          pixelCanvas[leftWing].g  = max(pixelCanvas[leftWing].g, burstColor.g);
+          pixelCanvas[leftWing].b  = max(pixelCanvas[leftWing].b, burstColor.b);
+
+          pixelCanvas[rightWing].r = max(pixelCanvas[rightWing].r, burstColor.r);
+          pixelCanvas[rightWing].g = max(pixelCanvas[rightWing].g, burstColor.g);
+          pixelCanvas[rightWing].b = max(pixelCanvas[rightWing].b, burstColor.b);
+
+          particles[i].popRadius++;
+        }
+        break;
+      }
+
+      default:
+        break;
+    }
+  }
+
+  renderCanvas();
+}
+
+// Standard multi-digit playback sequence
+void playbackSequence(String sequence) {
+  if (sequence.length() == 0) return;
+
+  if (DEBUG) Serial.println("\n--- Launching Randomized Particle Engine (1s delay) ---");
+
+  for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
+
+  for (size_t i = 0; i < sequence.length(); i++) {
+    if (digitalRead(HOOK_PIN) == HIGH) break;
+
+    spawnParticle(sequence.charAt(i));
+
+    unsigned long delayStart = millis();
+    while (millis() - delayStart < DIGIT_SPAWN_GAP_MS) {
+      if (digitalRead(HOOK_PIN) == HIGH) break;
+      updateAndRenderParticles();
+      vTaskDelay(pdMS_TO_TICKS(15));
+    }
+  }
+
+  while (hasActiveParticles()) {
+    if (digitalRead(HOOK_PIN) == HIGH) break;
+    updateAndRenderParticles();
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  clearCanvas();
+
+  if (DEBUG) Serial.println("--- Particles finished. 1s Pause ---");
+  unsigned long pauseStart = millis();
+  while (millis() - pauseStart < 1000) {
+    if (digitalRead(HOOK_PIN) == HIGH) break;
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  bool hookOff = (digitalRead(HOOK_PIN) == LOW);
+  if (DEBUG) {
+    Serial.printf("--- Fading into %s state ---\n", hookOff ? "Green (Off-Hook)" : "Yellow (On-Hook)");
+  }
+
+  unsigned long fadeStart = millis();
+  const unsigned long TRANSITION_FADE_MS = 1000;
+
+  while (millis() - fadeStart < TRANSITION_FADE_MS) {
+    if (digitalRead(HOOK_PIN) != (hookOff ? LOW : HIGH)) break;
+
+    float progress = (float)(millis() - fadeStart) / (float)TRANSITION_FADE_MS;
+
+    uint8_t targetR, targetG, targetB;
+    if (hookOff) {
+      targetR = 0;
+      targetG = MAX_BRIGHT;
+      targetB = 0;
+    } else {
+      targetR = (uint8_t)(255 * 0.12f * (MAX_BRIGHT / 255.0f));
+      targetG = (uint8_t)(160 * 0.12f * (MAX_BRIGHT / 255.0f));
+      targetB = (uint8_t)(15  * 0.12f * (MAX_BRIGHT / 255.0f));
+    }
+
+    uint8_t curR = (uint8_t)(targetR * progress);
+    uint8_t curG = (uint8_t)(targetG * progress);
+    uint8_t curB = (uint8_t)(targetB * progress);
+
+    setRingColorRGB(curR, curG, curB);
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  if (DEBUG) Serial.println("--- Playback Sequence Complete ---\n");
+}
+
+// ==========================================
+// RED ALERT SWARM ENGINE (911 EASTER EGG)
+// ==========================================
+void runRedAlertSwarm() {
+  if (DEBUG) Serial.println("\n[RED ALERT] Launching 16-Pixel Red Particle Swarm...");
+
+  // 1. Clear current particles and canvas
+  for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
+  clearCanvas();
+
+  ColorRGB pureRed = { (float)MAX_BRIGHT, 0.0f, 0.0f };
+
+  // 2. Spawn 16 red particles at once
+  for (int p = 0; p < 16; p++) {
+    spawnParticle('!', pureRed);
+  }
+
+  // 3. Continuous Orbit Loop (Ignores dialer input until handset is replaced)
+  while (digitalRead(HOOK_PIN) == LOW) {
+    // Keep particle count replenished to 16 if particles pop
+    while (countActiveParticles() < 16) {
+      spawnParticle('!', pureRed);
+    }
+
+    updateAndRenderParticles();
+    vTaskDelay(pdMS_TO_TICKS(15));
+  }
+
+  if (DEBUG) Serial.println("[RED ALERT] Handset replaced. Ending Swarm.");
+}
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("\n--- ESP32 Candlestick Phone Controller (Pulse Engine v2) ---");
 
-  pinMode(dialPulsePin, INPUT_PULLUP);
-  pinMode(hookPin, INPUT_PULLUP);
-  pinMode(dialStartPin, INPUT_PULLUP);
-  
-  pinMode(statusLed, OUTPUT);
-  digitalWrite(statusLed, LOW);
+  pinMode(DIAL_PIN, INPUT_PULLUP);
+  pinMode(HOOK_PIN, INPUT_PULLUP);
+  pinMode(SHUNT_PIN, INPUT_PULLUP);
 
-  ledcAttach(audioPin, PWM_FREQ, PWM_RESOLUTION);
-  ledcWrite(audioPin, 128);
+  strip.begin();
+  strip.setBrightness(255);
+  clearCanvas();
 
-  audioTimer = timerBegin(SAMPLE_RATE);
-  timerAttachInterrupt(audioTimer, &onAudioTimer);
+  delay(50);
+  stableState = digitalRead(DIAL_PIN);
+  lastReadState = stableState;
 
-  // Trigger on RISING edge (when NC switch opens and pin goes HIGH)
-  attachInterrupt(digitalPinToInterrupt(dialPulsePin), countPulse, RISING);
+  lastHookState  = (digitalRead(HOOK_PIN) == LOW);
+  lastShuntState = (digitalRead(SHUNT_PIN) == LOW);
 
-  Serial.println("[SYSTEM] Hardware and DDS Audio Engine Ready.");
+  currentSystemState = lastHookState ? STATE_OFF_HOOK : STATE_IDLE_PULSE;
+
+  if (lastHookState) {
+    setRingColorRGB(0, MAX_BRIGHT, 0);
+  }
+
+  Serial.println("\n[SYSTEM] Rotary Controller Ready (Red Swarm Easter Egg).");
 }
 
 void loop() {
-  bool currentHookState  = (digitalRead(hookPin) == LOW);      // true = Off-Hook
-  bool currentWheelState = (digitalRead(dialStartPin) == LOW); // true = Wheel Off Rest
+  unsigned long now = millis();
 
-  // -----------------------------------------------------------------
-  // 1. HANDSET HOOK STATE
-  // -----------------------------------------------------------------
-  if (currentHookState) {
-    
-    if (!phoneOffHook) {
-      phoneOffHook = true;
-      digitalWrite(statusLed, HIGH);
-      
-      Serial.println("\n[HOOK] Handset LIFTED (Off-Hook). Starting dial tone...");
-      
-      portENTER_CRITICAL(&timerMux);
-      phaseAcc350 = 0;
-      phaseAcc440 = 0;
-      toneIsPlaying = true;
-      portEXIT_CRITICAL(&timerMux);
-    }
+  // 1. READ HARDWARE INPUTS
+  int rawState = digitalRead(DIAL_PIN);
+  bool hookOffCradle = (digitalRead(HOOK_PIN) == LOW);
+  bool shuntFlipped  = (digitalRead(SHUNT_PIN) == LOW);
 
-    // ---------------------------------------------------------------
-    // 2. DIAL WHEEL MOVEMENT STATE
-    // ---------------------------------------------------------------
-    if (currentWheelState && !dialWheelActive) {
-      dialWheelActive = true;
+  // 2. HOOK STATE MONITORING WITH RESET LOGIC
+  if (hookOffCradle != lastHookState) {
+    vTaskDelay(pdMS_TO_TICKS(20));
+    if (hookOffCradle) {
+      if (DEBUG) Serial.println("\n[HOOK] Handset LIFTED -> Fade to Green");
+      runHookStateFade(0, MAX_BRIGHT, 0, 250, true);
+      currentSystemState = STATE_OFF_HOOK;
+    } else {
+      if (DEBUG) Serial.println("\n[HOOK] Handset REPLACED -> FULL RESET to Ambient Yellow");
       
-      // Clear wind-up noise
-      portENTER_CRITICAL(&timerMux);
+      // Clear particle memory on hook replacement
+      for (int i = 0; i < MAX_PARTICLES; i++) particles[i].active = false;
+      
+      uint8_t targetR = (uint8_t)(255 * 0.12f * (MAX_BRIGHT / 255.0f));
+      uint8_t targetG = (uint8_t)(160 * 0.12f * (MAX_BRIGHT / 255.0f));
+      uint8_t targetB = (uint8_t)(15  * 0.12f * (MAX_BRIGHT / 255.0f));
+      
+      runHookStateFade(targetR, targetG, targetB, 350, false);
+      currentSystemState = STATE_IDLE_PULSE;
+
+      dialedNumber = "";
+      numberPending = false;
       pulseCount = 0;
-      portEXIT_CRITICAL(&timerMux);
-      
-      Serial.println("[DIAL] Wheel pulled off rest position.");
-
-      if (toneIsPlaying) {
-        portENTER_CRITICAL(&timerMux);
-        toneIsPlaying = false;
-        portEXIT_CRITICAL(&timerMux);
-        
-        digitalWrite(statusLed, LOW);
-        Serial.println("[AUDIO] Dial tone CUT.");
-      }
-    } 
-    else if (!currentWheelState && dialWheelActive) {
-      dialWheelActive = false;
-      Serial.println("[DIAL] Wheel returned flush to rest position.");
+      dialActive = false;
     }
+    lastHookState = hookOffCradle;
+  }
 
-    // ---------------------------------------------------------------
-    // 3. DIGIT COMPLETE CHECK (DUAL-CONDITION TERMINATION)
-    // ---------------------------------------------------------------
-    int currentCount = 0;
-    unsigned long timeSinceLastPulse = 0;
-    unsigned long localLastPulse = 0;
-
-    portENTER_CRITICAL(&timerMux);
-    currentCount = pulseCount;
-    localLastPulse = lastPulseTime;
-    portEXIT_CRITICAL(&timerMux);
-
-    if (currentCount > 0) {
-      timeSinceLastPulse = millis() - localLastPulse;
-      
-      // Commit digit if timeout reached OR wheel has snapped back to rest position
-      if (timeSinceLastPulse > dialTimeout || (!currentWheelState && timeSinceLastPulse > 100)) {
-        
-        portENTER_CRITICAL(&timerMux);
-        pulseCount = 0;
-        portEXIT_CRITICAL(&timerMux);
-
-        int displayDigit = (currentCount == 10) ? 0 : currentCount;
-        Serial.printf("[DIAL] Digit Complete! Raw Pulses: %d -> Dialed Number: %d\n", currentCount, displayDigit);
-
-        blinkDigit(currentCount);
-      }
+  // 3. SHUNT MONITORING (Pull Sweep & Release Pulse)
+  if (hookOffCradle && currentSystemState != STATE_PLAYBACK && currentSystemState != STATE_RED_ALERT) {
+    if (shuntFlipped && !lastShuntState) {
+      if (DEBUG) Serial.println("[SHUNT] Wheel pulled -> Trigger CCW Sweep");
+      runCounterClockwiseSweep(0, 0, MAX_BRIGHT, 6);
+      currentSystemState = STATE_DIALING_SOLID;
     }
-
-  } else {
-    // ---------------------------------------------------------------
-    // 4. ON-HOOK / RESET STATE
-    // ---------------------------------------------------------------
-    if (phoneOffHook) {
-      phoneOffHook = false;
-      dialWheelActive = false;
-      
-      portENTER_CRITICAL(&timerMux);
-      pulseCount = 0;
-      toneIsPlaying = false;
-      portEXIT_CRITICAL(&timerMux);
-      
-      digitalWrite(statusLed, LOW);
-      Serial.println("\n[HOOK] Handset REPLACED (On-Hook). System reset.");
+    else if (!shuntFlipped && lastShuntState) {
+      if (DEBUG) Serial.println("[SHUNT] Wheel returned -> Single White Pulse");
+      runShuntReleasePulse();
     }
   }
-}
+  lastShuntState = shuntFlipped;
 
-void blinkDigit(int count) {
-  for (int i = 0; i < count; i++) {
-    digitalWrite(statusLed, HIGH);
-    delay(70);
-    digitalWrite(statusLed, LOW);
-    delay(70);
+  // 4. CORE PULSE COUNTING LOGIC
+  if (rawState != lastReadState) {
+    lastReadState = rawState;
+    lastChangeTime = now;
+  }
+
+  if ((now - lastChangeTime) >= DEBOUNCE_MS) {
+    if (rawState != stableState) {
+      stableState = rawState;
+
+      if (stableState != PULSE_LEVEL) {
+        pulseCount++;
+        dialActive = true;
+        lastPulseMillis = now;
+
+        if (hookOffCradle && currentSystemState != STATE_DIALING_SWEEP && currentSystemState != STATE_RED_ALERT) {
+          currentSystemState = STATE_DIALING_SOLID;
+        }
+
+        if (DEBUG) {
+          Serial.print("  -> pulse counted, running total for this digit: ");
+          Serial.println(pulseCount);
+        }
+      }
+    }
+  }
+
+  // 5. DIGIT & NUMBER TIMEOUTS WITH EASTER EGG ROUTING
+  if (dialActive && (now - lastPulseMillis) >= DIGIT_GAP_MS) {
+    int digit = (pulseCount == 10) ? 0 : pulseCount;
+    if (pulseCount > 0) {
+      if (DEBUG) {
+        Serial.print("  -> digit finalized: ");
+        Serial.println(digit);
+      }
+      dialedNumber += String(digit);
+      numberPending = true;
+
+      if (hookOffCradle && currentSystemState != STATE_RED_ALERT) {
+        currentSystemState = STATE_DIGIT_FADE;
+        fadeStartMillis = now;
+      }
+    }
+    pulseCount = 0;
+    dialActive = false;
+  }
+
+  if (numberPending && !dialActive && (now - lastPulseMillis) >= NUMBER_GAP_MS) {
+    Serial.print("\nNumber dialed: ");
+    Serial.println(dialedNumber);
+
+    // --- EASTER EGG ROUTING ---
+    if (dialedNumber == "911") {
+      currentSystemState = STATE_RED_ALERT;
+      runRedAlertSwarm(); // Swarms 16 red particles until receiver is replaced
+
+      if (digitalRead(HOOK_PIN) == LOW) {
+        currentSystemState = STATE_OFF_HOOK;
+      } else {
+        currentSystemState = STATE_IDLE_PULSE;
+      }
+    } 
+    else {
+      currentSystemState = STATE_PLAYBACK;
+      playbackSequence(dialedNumber);
+
+      if (digitalRead(HOOK_PIN) == LOW) {
+        currentSystemState = STATE_OFF_HOOK;
+      } else {
+        currentSystemState = STATE_IDLE_PULSE;
+      }
+    }
+
+    dialedNumber = "";
+    numberPending = false;
+  }
+
+  // 6. LIGHT ENGINE
+  switch (currentSystemState) {
+    case STATE_IDLE_PULSE: {
+      // Ultra-slow Warm Soft Yellow Glow (10,000ms / 10-second period)
+      float breathVal = 0.12f + 0.88f * ((sin((float)now / 10000.0f * 2.0f * PI) + 1.0f) / 2.0f);
+      
+      uint8_t r = (uint8_t)(255 * breathVal * (MAX_BRIGHT / 255.0f));
+      uint8_t g = (uint8_t)(160 * breathVal * (MAX_BRIGHT / 255.0f));
+      uint8_t b = (uint8_t)(15  * breathVal * (MAX_BRIGHT / 255.0f));
+      
+      setRingColorRGB(r, g, b);
+      break;
+    }
+
+    case STATE_OFF_HOOK:
+      setRingColorRGB(0, MAX_BRIGHT, 0); // Solid Green
+      break;
+
+    case STATE_DIALING_SOLID:
+      setRingColorRGB(0, 0, MAX_BRIGHT); // Solid Blue
+      break;
+
+    case STATE_DIGIT_FADE: {
+      // Fades out from Dialing Blue to Black after dialing stops
+      unsigned long elapsed = now - fadeStartMillis;
+      if (elapsed >= FADE_DURATION_MS) {
+        setRingColorRGB(0, 0, 0); // Complete fade to black
+      } else {
+        float progress = (float)elapsed / (float)FADE_DURATION_MS;
+        uint8_t b = (uint8_t)(MAX_BRIGHT * (1.0f - progress));
+        setRingColorRGB(0, 0, b);
+      }
+      break;
+    }
+
+    case STATE_RED_ALERT:
+    case STATE_DIALING_SWEEP:
+    case STATE_PLAYBACK:
+      break;
   }
 }
